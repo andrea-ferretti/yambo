@@ -83,8 +83,9 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
 
  complex(SP),allocatable, target DEV_ATTR :: Xo_res(:,:)
  complex(SP),allocatable DEV_ATTR :: work(:)
+ complex(SP),allocatable DEV_ATTR :: rhotw_mp_R(:,:),rhotw_mp_C(:,:)
  complex(SP),allocatable DEV_ATTR :: rhotw_buff_R(:,:),rhotw_buff_C(:,:),GreenF_buff(:)
- complex(SP),pointer     DEV_ATTR :: X_par_p(:,:,:)
+ complex(SP),pointer     DEV_ATTR :: X_par_p(:,:,:), Xo_p(:,:)
  integer              :: lwork,ntx
  !
  complex(SP), allocatable          :: GreenF(:)
@@ -383,20 +384,20 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
    !
    !
 #ifdef _GPU
-   !   
+   !
    !--------------
    ! GPU version
    !--------------
-   !   
+   !
    nt = bare_grid_N(i_cg)
    ibuff_s = ibuff+1
    ibuff_e = ibuff_s+nt-1
-   !   
+   !
    call devxlib_memcpy_h2d(DEV_VAR(GreenF),GreenF)
 
-   !   
+   !
    ! filling of the buffers
-   !   
+   !
    !DEV_ACC parallel loop collapse(2) async
    !DEV_CUF kernel do(2) <<<*,*>>>
    !DEV_OMPGPU target map(present,alloc:rhotw_buff_R,rhotw_mp_R)

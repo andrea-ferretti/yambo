@@ -5,6 +5,7 @@
  PARALLEL_HERMITIAN_diagx.o
  PARALLEL_M_by_M.o
  PARALLEL_M_by_V.o
+ PARALLEL_PSEUDOHERM_chase.o
  PARALLEL_inversion.o
  PARALLEL_lin_system.o
  PARALLEL_lin_system_gpu.o
