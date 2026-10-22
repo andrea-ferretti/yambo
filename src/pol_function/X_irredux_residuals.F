@@ -214,12 +214,10 @@ subroutine X_irredux_residuals(Xen,Xk,X,Dip,i_cg,iq,Xo_res,Xo_scatt,&
      !
    endif
    !
-   ! Filling the upper triangular part of the residual here ! 
    !-------------^^^^^---------------------------------------
    !   
-   ! AF: in this implementation we just store the data in rhotw_mp
-   !     Later on, we multiply rhotw_mp*rhotw_mp^dag to build 
-   !     the whole residue matrix (both upper and lower parts)
+   ! AF: in this implementation we just store the data in rhotw_mp_R/C
+   !     the actual building of Xo is done in X_irredux, using xGEMM
    !
    !DEV_ACC_DEBUG data present(rhotw_mp_R,Xo_scatt_rhotw_p)
    !DEV_ACC parallel loop async
@@ -232,20 +230,16 @@ subroutine X_irredux_residuals(Xen,Xk,X,Dip,i_cg,iq,Xo_res,Xo_scatt,&
    !DEV_OMPGPU end target
    !DEV_ACC_DEBUG end data
    !
-   if (PAR_COM_RL_INDEX%n_CPU>1) then
-     !
-     !DEV_ACC_DEBUG data present(rhotw_mp_C,Xo_scatt_rhotw_p)
-     !DEV_ACC parallel loop async
-     !DEV_CUF kernel do <<<*,*>>>
-     !DEV_OMPGPU target map(present,alloc:rhotw_mp_C,Xo_scatt_rhotw_p)
-     !DEV_OMPGPU teams loop
-     do ig1=X_cols1,X_cols2
-       rhotw_mp_C(ig1,i_bg) = sqrt(Z_eh_occ) * conjg(Xo_scatt_rhotw_p(ig1))
-     enddo
-     !DEV_OMPGPU end target
-     !DEV_ACC_DEBUG end data
-     !
-   endif
+   !DEV_ACC_DEBUG data present(rhotw_mp_C,Xo_scatt_rhotw_p)
+   !DEV_ACC parallel loop async
+   !DEV_CUF kernel do <<<*,*>>>
+   !DEV_OMPGPU target map(present,alloc:rhotw_mp_C,Xo_scatt_rhotw_p)
+   !DEV_OMPGPU teams loop
+   do ig1=X_cols1,X_cols2
+     rhotw_mp_C(ig1,i_bg) = sqrt(Z_eh_occ) * conjg(Xo_scatt_rhotw_p(ig1))
+   enddo
+   !DEV_OMPGPU end target
+   !DEV_ACC_DEBUG end data
 
    !
    ! add terminator specific corrections
@@ -316,39 +310,23 @@ subroutine X_irredux_residuals(Xen,Xk,X,Dip,i_cg,iq,Xo_res,Xo_scatt,&
    !
  enddo loop_bare_grid
  !
- ! build the residues
- !
- nt = bare_grid_N(i_cg)
- !
- ! mm_cgemm_gpu
- !
- if (PAR_COM_RL_INDEX%n_CPU>1) then
-   !
-   call devxlib_xGEMM_gpu('N','C',X_rows(2)-X_rows(1)+1, X_cols(2)-X_cols(1)+1, nt, cONE, &
-&                         rhotw_mp_R, X_rows(2)-X_rows(1)+1, &
-&                         rhotw_mp_C, X_cols(2)-X_cols(1)+1, &
-&                         cONE, Xo_res, X_rows(2)-X_rows(1)+1 )
-   !
- else
-   !
-   call devxlib_xGEMM_gpu('N','C',X_rows(2)-X_rows(1)+1, X_cols(2)-X_cols(1)+1, nt, cONE, &
-&                         rhotw_mp_R, X_rows(2)-X_rows(1)+1, &
-&                         rhotw_mp_R, X_cols(2)-X_cols(1)+1, &
-&                         cONE, Xo_res, X_rows(2)-X_rows(1)+1 )
-   !
- endif
  !
  ! finalize
  !
+ nt = bare_grid_N(i_cg)
+ !
  if (iq==1.and.abs(coarse_grid_Pt(i_cg))<Dip%Energy_treshold) then
-    !DEV_ACC_DEBUG data present(Xo_res)
-    !DEV_ACC serial async
-    !DEV_OMPGPU target map(present,alloc:Xo_res)
-    ctmp=Xo_res(1,1)
-    Xo_res(1,1)=ctmp/real(drude_n_states,SP)
+    !
+    !DEV_ACC parallel loop async
+    !DEV_CUF kernel do <<<*,*>>>
+    !DEV_OMPGPU target map(present,alloc:rhotw_mp_R,rhotw_mp_C)
+    !DEV_OMPGPU teams loop
+    do i_bg = 1, nt
+      rhotw_mp_R(1,i_bg) = rhotw_mp_R(1,i_bg) / sqrt(real(drude_n_states,SP))
+      rhotw_mp_C(1,i_bg) = rhotw_mp_C(1,i_bg) / sqrt(real(drude_n_states,SP))
+    enddo
     !DEV_OMPGPU end target
-    !DEV_ACC end serial
-    !DEV_ACC_DEBUG end data
+    !
  endif
  !
 end subroutine X_irredux_residuals

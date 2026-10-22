@@ -3,7 +3,7 @@
 !
 ! Copyright (C) 2013 The Yambo Team
 !
-! Authors (see AUTHORS file for details): AMDSAFFA
+! Authors (see AUTHORS file for details): AM DS AF FA
 !
 !> @callgraph
 !> @callergraph
@@ -21,10 +21,11 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
  !
  ! X terminator (BG kind) implemented (IM,AF)
  ! 
+ use iso_c_binding, ONLY:c_f_pointer,c_loc
  use drivers,       ONLY:l_life
  use IO_m,          ONLY:io_RESPONSE,io_DIP
  use ALLOC,         ONLY:DIPOLE_ALLOC_global
- use pars,          ONLY:SP,cZERO,schlen,pi
+ use pars,          ONLY:SP,cZERO,cONE,schlen,pi
  use wrapper,       ONLY:V_plus_alpha_V,vv_caxpy
  use LIVE_t,        ONLY:live_timing
  use com,           ONLY:msg
@@ -45,7 +46,7 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
  use D_lattice,     ONLY:i_space_inv,alat
  use collision_el,  ONLY:elemental_collision,elemental_collision_free,elemental_collision_alloc
  use DIPOLES,       ONLY:DIPOLE_t
- use X_m,           ONLY:X_t,X_poles,X_Ein_poles,current_iq,X_poles_tab,&
+ use X_m,           ONLY:X_t,X_poles,X_Ein_poles,current_iq,X_poles_tab,X_nbuffx,&
 &                        self_detect_E_range,X_FILL_UP_matrix_only,use_X_DbGd,&
 &                        l_X_terminator,X_terminator_E,X_term_E,drude_n_states
 #if defined _SC 
@@ -53,8 +54,11 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
  use SC,            ONLY:it_now
 #endif
  use gpu_m,         ONLY:have_gpu,have_openacc,have_ompgpu
- use devxlib,       ONLY:devxlib_memcpy_d2h,devxlib_memcpy_h2d
+ use devxlib,       ONLY:devxlib_memcpy_d2h,devxlib_memcpy_h2d,devxlib_xGEMM_gpu,devxlib_memset_d
  use timing_m,      ONLY:timing
+#if defined _CUDAF
+ use cudafor,       ONLY:c_devloc
+#endif
  !
 #include<dev_defs.h>
 #include<y_memory.h>
@@ -75,23 +79,34 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
 &                        X_rows1,X_rows2,X_cols1,X_cols2,X_nrows,io_err
  logical              :: force_bare_X_G,Drude_pole,skip_WF_load
  real(SP)             :: minmax_ehe(2,PAR_COM_X_WORLD%n_CPU),cutoff,lcut,Dirac_v_f_au
- complex(SP)          :: GreenF(Xw%n_freqs),drude_GreenF(Xw%n_freqs),ctmp(1,1),X_Dirac
+ complex(SP)          :: ctmp(1,1),X_Dirac
 
  complex(SP),allocatable, target DEV_ATTR :: Xo_res(:,:)
  complex(SP),allocatable DEV_ATTR :: work(:)
- complex(SP),allocatable DEV_ATTR :: rhotw_mp_R(:,:), rhotw_mp_C(:,:)
+ complex(SP),allocatable DEV_ATTR :: rhotw_buff_R(:,:),rhotw_buff_C(:,:),GreenF_buff(:)
  complex(SP),pointer     DEV_ATTR :: X_par_p(:,:,:)
- complex(SP)          :: GreenF_iw
  integer              :: lwork,ntx
  !
+ complex(SP), allocatable          :: GreenF(:)
+ complex(SP), allocatable DEV_ATTR :: GreenF_d(:)
+ complex(SP), allocatable          :: drude_GreenF(:)
+ !
+ integer              :: ibuff,ibuff_s,ibuff_e,nt,iv
+ logical              :: do_buff_accumulate
  integer, external    :: X_eh_setup
+ !
  type(elemental_collision), target :: Xo_scatt
 
  !
  ! Defaults & Setups
  !===================
- GreenF                           = cZERO
- drude_GreenF                     = cZERO
+ YAMBO_ALLOC( GreenF, (Xw%n_freqs))
+ YAMBO_ALLOC( drude_GreenF, (Xw%n_freqs))
+#if defined _GPU
+ YAMBO_ALLOC_GPU( DEV_VAR(GreenF), (Xw%n_freqs))
+#endif
+ GreenF = cZERO
+ drude_GreenF = cZERO
  !
  X_rows1=X_par%rows(1)
  X_rows2=X_par%rows(2)
@@ -247,6 +262,17 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
  YAMBO_ALLOC_GPU( rhotw_mp_R,(X_par%rows(1):X_par%rows(2),ntx) )
  YAMBO_ALLOC_GPU( rhotw_mp_C,(X_par%cols(1):X_par%cols(2),ntx) )
  !
+#ifdef _GPU
+ if (have_openacc.or.have_ompgpu) then
+   YAMBO_ALLOC( rhotw_buff_R,(X_par%rows(1):X_par%rows(2),X_nbuffx) )
+   YAMBO_ALLOC( rhotw_buff_C,(X_par%cols(1):X_par%cols(2),X_nbuffx) )
+   YAMBO_ALLOC( GreenF_buff,(X_nbuffx,Xw%n_freqs) )
+ endif
+ YAMBO_ALLOC_GPU( rhotw_buff_R,(X_par%rows(1):X_par%rows(2),X_nbuffx) )
+ YAMBO_ALLOC_GPU( rhotw_buff_C,(X_par%cols(1):X_par%cols(2),X_nbuffx) )
+ YAMBO_ALLOC_GPU( GreenF_buff,(X_nbuffx,Xw%n_freqs) )
+#endif
+ !
  call elemental_collision_free(Xo_scatt)
  call elemental_collision_alloc(Xo_scatt,NG=ngrho,TITLE="Xo") 
 
@@ -355,32 +381,114 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
    ! 3) Finally multiply residual and frequency dependent term
    !===========================================================
    !
-   !DEV_ACC_DEBUG data present(X_par_p,Xo_res)
+   !
+#ifdef _GPU
+   !   
+   !--------------
+   ! GPU version
+   !--------------
+   !   
+   nt = bare_grid_N(i_cg)
+   ibuff_s = ibuff+1
+   ibuff_e = ibuff_s+nt-1
+   !   
+   call devxlib_memcpy_h2d(DEV_VAR(GreenF),GreenF)
+
+   !   
+   ! filling of the buffers
+   !   
+   !DEV_ACC parallel loop collapse(2) async
+   !DEV_CUF kernel do(2) <<<*,*>>>
+   !DEV_OMPGPU target map(present,alloc:rhotw_buff_R,rhotw_mp_R)
+   !DEV_OMPGPU teams loop collapse(2)
+   do iv = 1, nt
+     do ig1=X_rows1,X_rows2
+       rhotw_buff_R(ig1,ibuff_s+iv-1) = rhotw_mp_R(ig1,iv)
+     enddo
+   enddo
+   !DEV_OMPGPU end target
+   !
+   !DEV_ACC parallel loop collapse(2) async
+   !DEV_CUF kernel do(2) <<<*,*>>>
+   !DEV_OMPGPU target map(present,alloc:rhotw_buff_C,rhotw_mp_C)
+   !DEV_OMPGPU teams loop collapse(2)
+   do iv = 1, nt
+     do ig1=X_cols1,X_cols2
+       rhotw_buff_C(ig1,ibuff_s+iv-1) = rhotw_mp_C(ig1,iv)
+     enddo
+   enddo
+   !DEV_OMPGPU end target
+   !
+   !DEV_ACC parallel loop collapse(2) async
+   !DEV_CUF kernel do(2) <<<*,*>>>
+   !DEV_OMPGPU target map(present,alloc:GreenF_buff,GreenF)
+   !DEV_OMPGPU teams loop collapse(2)
+   do iw=1,Xw%n_freqs
+     do iv = 1, nt
+       GreenF_buff(ibuff_s+iv-1,iw) = DEV_VAR(GreenF)(iw)
+     enddo
+   enddo
+   !DEV_OMPGPU end target
+   !
+   ibuff = ibuff_e
+
+   !
+   ! process and accumulate the contributions from the buffers
+   !
+   do_buff_accumulate=.false.
+   if ( i_cg==coarse_grid_N ) then
+      do_buff_accumulate=.true.
+   elseif ( ibuff_e + bare_grid_N(i_cg+1) > X_nbuffx) then
+      do_buff_accumulate=.true.
+   endif
+   !
+   if ( do_buff_accumulate ) then
+     !
+     freq_loop_accumulate: &
+     do iw=1,Xw%n_freqs
+       !
+       !DEV_ACC parallel loop collapse(2) async
+       !DEV_CUF kernel do(2) <<<*,*>>>
+       !DEV_OMPGPU target map(present,alloc:rhotw_buff_C,GreenF_buff)
+       !DEV_OMPGPU teams loop collapse(2)
+       do iv = 1, ibuff
+         do ig1=X_cols1,X_cols2
+           rhotw_buff_C(ig1,iv) = rhotw_buff_C(ig1,iv) * conjg( GreenF_buff(iv,iw) )
+         enddo
+       enddo
+       !DEV_OMPGPU end target
+       !
+       ! final GEMM
+       !
+#ifdef _CUDAF
+       call c_f_pointer(c_devloc(X_par_p(1,1,iw)), Xo_p, (/X_rows2-X_rows1+1,X_cols2-X_cols1+1/) )
+#else
+       call c_f_pointer(c_loc(X_par_p(1,1,iw)), Xo_p, (/X_rows2-X_rows1+1,X_cols2-X_cols1+1/) )
+#endif
+       !
+       call devxlib_xGEMM_gpu('N','C',X_rows2-X_rows1+1, X_cols2-X_cols1+1, ibuff, cONE, &
+                              rhotw_buff_R, X_rows2-X_rows1+1, rhotw_buff_C, X_cols2-X_cols1+1, &
+                              cONE, Xo_p, X_rows2-X_rows1+1 )
+       !
+     enddo freq_loop_accumulate
+     !
+     ibuff   = 0
+     ibuff_s = 1
+     ibuff_e = nt
+     !
+     call devxlib_memset_d( rhotw_buff_R, cZERO)
+     call devxlib_memset_d( rhotw_buff_C, cZERO)
+     call devxlib_memset_d( GreenF_buff, cZERO)
+     !
+   endif
+   !
+#else
+   !--------------
+   ! CPU version
+   !--------------
    !
    freq_loop:&
    do iw=1,Xw%n_freqs
-     !
-     ! ----    ----
-     ! -xxx    -xxx
-     ! ---- => ----
-     ! ----    ----
-     !
-#ifdef _GPU
-     !
-     GreenF_iw=GreenF(iw)
-     !
-     !DEV_ACC parallel loop collapse(2) async
-     !DEV_CUF kernel do(2) <<<*,*>>>
-     !DEV_OMPGPU target map(present,alloc:X_par_p,Xo_res)
-     !DEV_OMPGPU teams loop collapse(2)
-     do ig2=X_cols1,X_cols2
-     do ig1=X_rows1,X_rows2
-       X_par_p(ig1,ig2,iw)=X_par_p(ig1,ig2,iw)+GreenF_iw*Xo_res(ig1,ig2)
-     enddo
-     enddo
-     !DEV_OMPGPU end target
-     !
-#else
      !
      do ig2=X_cols1,X_cols2
        !
@@ -398,11 +506,10 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
 #  endif
      enddo
      !
-#endif
-     !
    enddo freq_loop
    !
-   !DEV_ACC_DEBUG end data
+#endif
+   !
    !
    if (master_thread) call live_timing(steps=1)
    !
@@ -412,20 +519,31 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
  !
  ! CLEAN
  !=======
+ ! AF: this GPU alloc can be removed
  YAMBO_FREE_GPU(Xo_res)
  YAMBO_FREE(Xo_res)
  !
 #ifdef _GPU
  YAMBO_FREE_GPU(work)
-#endif
  YAMBO_FREE(work)
+ YAMBO_FREE_GPU(rhotw_buff_L)
+ YAMBO_FREE_GPU(rhotw_buff_R)
+ YAMBO_FREE_GPU(GreenF_buff)
+ YAMBO_FREE(rhotw_buff_L)
+ YAMBO_FREE(rhotw_buff_R)
+ YAMBO_FREE(GreenF_buff)
+#endif
  YAMBO_FREE_GPU(rhotw_mp_R)
  YAMBO_FREE(rhotw_mp_R)
  YAMBO_FREE_GPU(rhotw_mp_C)
  YAMBO_FREE(rhotw_mp_C)
+ !
  call elemental_collision_free(Xo_scatt)
  !
  !DEV_OMP end parallel
+ !
+ YAMBO_FREE_GPU(DEV_VAR(GreenF))
+ YAMBO_FREE(GreenF)
  !
  !
  if (iq==1.and.io_DIP) call DIPOLE_ALLOC_global()

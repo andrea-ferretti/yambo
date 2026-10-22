@@ -86,6 +86,7 @@ module X_m
  real(SP),    allocatable :: X_Ein_poles(:)
  integer ,    allocatable :: X_poles_tab(:,:)
  integer ,    allocatable :: X_RLcomp_ig(:)
+ integer :: X_nbuffx = 50000
  integer :: X_ng = 0
  integer :: current_iq
  logical :: X_FILL_UP_matrix_only
