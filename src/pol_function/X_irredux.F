@@ -84,7 +84,7 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
  complex(SP),allocatable, target DEV_ATTR :: Xo_res(:,:)
  complex(SP),allocatable DEV_ATTR :: work(:)
  complex(SP),allocatable DEV_ATTR :: rhotw_mp_R(:,:),rhotw_mp_C(:,:)
- complex(SP),allocatable DEV_ATTR :: rhotw_buff_R(:,:),rhotw_buff_C(:,:),GreenF_buff(:)
+ complex(SP),allocatable DEV_ATTR :: rhotw_buff_R(:,:),rhotw_buff_C(:,:),rhotw_buff_R_GF(:,:),GreenF_buff(:,:)
  complex(SP),pointer     DEV_ATTR :: X_par_p(:,:,:), Xo_p(:,:)
  integer              :: lwork,ntx
  !
@@ -196,8 +196,7 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
  ! AF: Despite one could exploit
  !
  ! Time-Rev is Spatial Inv to evaluate only half X
- ! if (X_FILL_UP_matrix_only.and.current_iq==0) write(*,*) '[X] Upper matrix
- ! triangle filled'
+ ! if (X_FILL_UP_matrix_only.and.current_iq==0) write(*,*) '[X] Upper matrix triangle filled'
  !
  ! in the present version, the whole matrix is evaluated
 
@@ -211,14 +210,8 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
    call OPENMP_set_threads(n_threads_in=n_threads_X, use_nested=.false.)
  else
 #if defined _OPENMP
-#  if defined _NESTING
-   call OPENMP_set_threads(n_threads_in=n_threads_X, use_nested=.true.)
-   n_threads_FFT=n_inn_threads
-   call msg('s','[X] NESTED openmp parallelism on: n_out_threads/n_inn_threads = ',(/n_out_threads,n_inn_threads/))
-#  else
    call OPENMP_set_threads(n_threads_in=n_threads_X, use_nested=.false.)
    n_threads_FFT=1
-#  endif
    if(n_threads_X>1) call OPENMP_locks_reset(INIT=.true.,nlocks=16)
 #endif
  endif
@@ -260,18 +253,30 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
  YAMBO_ALLOC_GPU( work,(lwork))
  !
  ntx=maxval(bare_grid_N)
+ !
+#ifdef _OPENACC || _OPENMP_GPU
+ YAMBO_ALLOC( rhotw_mp_R,(X_par%rows(1):X_par%rows(2),ntx) )
+ YAMBO_ALLOC( rhotw_mp_C,(X_par%cols(1):X_par%cols(2),ntx) )
+#endif
  YAMBO_ALLOC_GPU( rhotw_mp_R,(X_par%rows(1):X_par%rows(2),ntx) )
  YAMBO_ALLOC_GPU( rhotw_mp_C,(X_par%cols(1):X_par%cols(2),ntx) )
  !
 #ifdef _GPU
  if (have_openacc.or.have_ompgpu) then
+   YAMBO_ALLOC( rhotw_buff_R_GF,(X_par%rows(1):X_par%rows(2),X_nbuffx) )
    YAMBO_ALLOC( rhotw_buff_R,(X_par%rows(1):X_par%rows(2),X_nbuffx) )
    YAMBO_ALLOC( rhotw_buff_C,(X_par%cols(1):X_par%cols(2),X_nbuffx) )
    YAMBO_ALLOC( GreenF_buff,(X_nbuffx,Xw%n_freqs) )
  endif
+ YAMBO_ALLOC_GPU( rhotw_buff_R_GF,(X_par%rows(1):X_par%rows(2),X_nbuffx) )
  YAMBO_ALLOC_GPU( rhotw_buff_R,(X_par%rows(1):X_par%rows(2),X_nbuffx) )
  YAMBO_ALLOC_GPU( rhotw_buff_C,(X_par%cols(1):X_par%cols(2),X_nbuffx) )
  YAMBO_ALLOC_GPU( GreenF_buff,(X_nbuffx,Xw%n_freqs) )
+ !
+ call devxlib_memset_d( rhotw_buff_R_GF, cZERO)
+ call devxlib_memset_d( rhotw_buff_R, cZERO)
+ call devxlib_memset_d( rhotw_buff_C, cZERO)
+ call devxlib_memset_d( GreenF_buff, cZERO)
 #endif
  !
  call elemental_collision_free(Xo_scatt)
@@ -287,8 +292,8 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
      if(.not.Drude_pole) cycle
      if(.not.(X_par%rows(1)==1.and.X_par%cols(1)==1)) cycle
      !
-     call X_irredux_residuals(Xen,Xk,X,Dip,i_cg,iq,Xo_res,Xo_scatt,&
-&                             work,lwork,rhotw_mp_R,rhotw_mp_C,ntx)
+     call X_irredux_residuals_std(Xen,Xk,X,Dip,i_cg,iq,Xo_res,Xo_scatt,&
+&                                 work,lwork,rhotw_mp_R,rhotw_mp_C,ntx)
      !
      ! AF:
      ! ctmp is allocated as ctmp(1,1) to be compliant with devxlib interfaces
@@ -336,7 +341,11 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
        !
        X_par%blc(1,1,1)=X_par%blc(1,1,1)+X_Dirac
        !
-       if (have_gpu) X_par%blc_d(1,1,1)=X_par%blc(1,1,1)
+       if (have_gpu) then
+         do iw=1,Xw%n_freqs
+           call devxlib_memcpy_h2d(DEV_VAR(X_par%blc)(1:1,1,1),X_par%blc(1:1,1,1))
+         enddo
+       endif
        !
      endif
      !
@@ -346,6 +355,8 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
  !
  ! MAIN LOOP
  !===========
+ !
+ ibuff=0
  !
  !DEV_OMP do schedule(dynamic)
  !
@@ -381,7 +392,6 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
    !
    ! 3) Finally multiply residual and frequency dependent term
    !===========================================================
-   !
    !
 #ifdef _GPU
    !
@@ -450,11 +460,11 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
        !
        !DEV_ACC parallel loop collapse(2) async
        !DEV_CUF kernel do(2) <<<*,*>>>
-       !DEV_OMPGPU target map(present,alloc:rhotw_buff_C,GreenF_buff)
+       !DEV_OMPGPU target map(present,alloc:rhotw_buff_R_GF,rhotw_buff_R,GreenF_buff)
        !DEV_OMPGPU teams loop collapse(2)
        do iv = 1, ibuff
          do ig1=X_cols1,X_cols2
-           rhotw_buff_C(ig1,iv) = rhotw_buff_C(ig1,iv) * conjg( GreenF_buff(iv,iw) )
+           rhotw_buff_R_GF(ig1,iv) = rhotw_buff_R(ig1,iv) * GreenF_buff(iv,iw)
          enddo
        enddo
        !DEV_OMPGPU end target
@@ -468,7 +478,7 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
 #endif
        !
        call devxlib_xGEMM_gpu('N','C',X_rows2-X_rows1+1, X_cols2-X_cols1+1, ibuff, cONE, &
-                              rhotw_buff_R, X_rows2-X_rows1+1, rhotw_buff_C, X_cols2-X_cols1+1, &
+                              rhotw_buff_R_GF, X_rows2-X_rows1+1, rhotw_buff_C, X_cols2-X_cols1+1, &
                               cONE, Xo_p, X_rows2-X_rows1+1 )
        !
      enddo freq_loop_accumulate
@@ -477,6 +487,7 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
      ibuff_s = 1
      ibuff_e = nt
      !
+     call devxlib_memset_d( rhotw_buff_R_GF, cZERO)
      call devxlib_memset_d( rhotw_buff_R, cZERO)
      call devxlib_memset_d( rhotw_buff_C, cZERO)
      call devxlib_memset_d( GreenF_buff, cZERO)
@@ -527,11 +538,13 @@ subroutine X_irredux(iq,what,X_par,Xen,Xk,Xw,X,Dip)
 #ifdef _GPU
  YAMBO_FREE_GPU(work)
  YAMBO_FREE(work)
- YAMBO_FREE_GPU(rhotw_buff_L)
+ YAMBO_FREE_GPU(rhotw_buff_R_GF)
  YAMBO_FREE_GPU(rhotw_buff_R)
+ YAMBO_FREE_GPU(rhotw_buff_C)
  YAMBO_FREE_GPU(GreenF_buff)
- YAMBO_FREE(rhotw_buff_L)
+ YAMBO_FREE(rhotw_buff_R_GF)
  YAMBO_FREE(rhotw_buff_R)
+ YAMBO_FREE(rhotw_buff_C)
  YAMBO_FREE(GreenF_buff)
 #endif
  YAMBO_FREE_GPU(rhotw_mp_R)
